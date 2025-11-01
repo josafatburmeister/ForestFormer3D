@@ -25,6 +25,7 @@ model = dict(
     query_point_num=300,   #modify the number of query points
     radius=radius,
     score_th = score_th,
+    chunk=chunk,
     backbone=dict(
         type='SpConvUNet',
         num_planes=[num_channels * (i + 1) for i in range(5)],
