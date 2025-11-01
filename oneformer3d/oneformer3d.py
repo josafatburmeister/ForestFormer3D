@@ -13,7 +13,7 @@ import os
 import numpy as np
 from tools.base_modules import Seq, MLP, FastBatchNorm1d
 from .panoptic_losses import offset_loss, discriminative_loss, FastFocalLoss
-from torch_cluster import fps
+from torch_cluster import fps, knn
 import re
 import math
 import collections 
@@ -2342,9 +2342,9 @@ class ForAINetV2OneFormer3D_XAwarequery(Base3DDetector):
                     chunk = self.chunk
                     for ss in range(0, pc1.shape[0], chunk):
                         ee = min(ss + chunk, pc1.shape[0])
-                        nn_idx_pc1.append(
-                            torch.cdist(pc1[ss:ee].float(), pc3.float()).argmin(1)
-                        )
+
+                        neighbor_graph_edge_indices = knn(pc3.float(), pc1[ss:ee].float(), 1)
+                        nn_idx_pc1.append(neighbor_graph_edge_indices[1].flatten())
                     nn_idx_pc1 = torch.cat(nn_idx_pc1)   # (N_pc1,)  
                 if tree_indices.numel() > 1:
                     
@@ -2420,7 +2420,17 @@ class ForAINetV2OneFormer3D_XAwarequery(Base3DDetector):
 
                         # ② voxel → pc1   (K, N_pc1)  → COO
                         mk_bool = masks_kept[:, nn_idx_pc1]             # bool
-                        rows, cols = mk_bool.nonzero(as_tuple=True)     
+                        if mk_bool.numel() > torch.iinfo(torch.int).max:
+                            rows = []
+                            cols = []
+                            for row in range(mk_bool.shape[0]):
+                                cols_i = mk_bool[row].nonzero().flatten()
+                                cols.append(cols_i)
+                                rows.extend([row] * len(cols_i))
+                            rows = torch.tensor(rows, device=mk_bool.device, dtype=torch.long)
+                            cols = torch.concatenate(cols)
+                        else:
+                            rows, cols = mk_bool.nonzero(as_tuple=True)
                         score_per_hit = scores_kept[rows]               # (nnz,)
 
                         N1 = pc1.shape[0]
