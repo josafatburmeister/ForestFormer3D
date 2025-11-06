@@ -2420,7 +2420,7 @@ class ForAINetV2OneFormer3D_XAwarequery(Base3DDetector):
 
                         # ② voxel → pc1   (K, N_pc1)  → COO
                         mk_bool = masks_kept[:, nn_idx_pc1]             # bool
-                        if mk_bool.numel() > torch.iinfo(torch.int).max:
+                        if mk_bool.numel() > torch.iinfo(torch.int).max * 0.5:
                             rows = []
                             cols = []
                             for row in range(mk_bool.shape[0]):
