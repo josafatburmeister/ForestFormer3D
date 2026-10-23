@@ -12,7 +12,7 @@ score_th = 00.4
 chunk = 20_000
 model = dict(
     type='ForAINetV2OneFormer3D_XAwarequery',
-    data_preprocessor=dict(type='Det3DDataPreprocessor'),
+    data_preprocessor=dict(type='Det3DDataPreprocessor_'),
     in_channels=3,
     num_channels=num_channels,
     voxel_size=0.2,
@@ -74,7 +74,11 @@ model = dict(
         matrix_nms_kernel='linear',
         num_sem_cls=num_semantic_classes,
         stuff_cls=[0],
-        thing_cls=[0]))
+        thing_cls=[0],
+        profiling=dict(
+            enabled=True,
+            log_to_stdout=False,
+            csv_path='/workspace/data-2/wacv/profile_forest_former_3d/inference_profile_nibio_19.csv')))
 
 # dataset settings
 dataset_type = 'ForAINetV2SegDataset_'
@@ -86,7 +90,7 @@ data_prefix = dict(
 
 train_pipeline = [
     dict(
-        type='LoadPointsFromFile',
+        type='TimedLoadPointsFromFile_',
         coord_type='DEPTH',
         shift_height=False,
         use_color=False,
@@ -125,7 +129,7 @@ train_pipeline = [
 ]
 val_pipeline = [
     dict(
-        type='LoadPointsFromFile',
+        type='TimedLoadPointsFromFile_',
         coord_type='DEPTH',
         shift_height=False,
         use_color=False,
@@ -148,7 +152,7 @@ val_pipeline = [
 ]
 test_pipeline = [
     dict(
-        type='LoadPointsFromFile',
+        type='TimedLoadPointsFromFile_',
         coord_type='DEPTH',
         shift_height=False,
         use_color=False,

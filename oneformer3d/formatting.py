@@ -1,5 +1,6 @@
 # Adapted from mmdet3d/datasets/transforms/formating.py
 import numpy as np
+import time
 from .structures import InstanceData_
 from mmdet3d.datasets.transforms import Pack3DDetInputs
 from mmdet3d.datasets.transforms.formating import to_tensor
@@ -47,6 +48,9 @@ class Pack3DDetInputs_(Pack3DDetInputs):
             - 'data_samples' (:obj:`Det3DDataSample`): The annotation info
               of the sample.
         """
+        profiling_info = results.get('_profiling_info')
+        pack_start = time.perf_counter()
+
         # Format 3D data
         if 'points' in results:
             if isinstance(results['points'], BasePoints):
@@ -137,6 +141,13 @@ class Pack3DDetInputs_(Pack3DDetInputs):
             data_sample.eval_ann_info = results['eval_ann_info']
         else:
             data_sample.eval_ann_info = None
+
+        if profiling_info is not None:
+            profiling_info = dict(profiling_info)
+            profiling_info['pack_inputs_ms'] = round(
+                (time.perf_counter() - pack_start) * 1000.0, 3)
+            profiling_info['pipeline_wall_clock_end_ts'] = time.time()
+            data_sample.set_metainfo({'profiling_info': profiling_info})
 
         packed_results = dict()
         packed_results['data_samples'] = data_sample

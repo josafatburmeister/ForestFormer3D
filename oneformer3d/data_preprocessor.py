@@ -1,4 +1,6 @@
 # Copied from mmdet3d/models/data_preprocessors/data_preprocessor.py
+import time
+
 from mmdet3d.models.data_preprocessors.data_preprocessor import \
     Det3DDataPreprocessor
 from mmdet3d.registry import MODELS
@@ -24,6 +26,8 @@ class Det3DDataPreprocessor_(Det3DDataPreprocessor):
         Returns:
             dict: Data in the same format as the model input.
         """
+        preprocessor_start = time.perf_counter()
+
         if 'img' in data['inputs']:
             batch_pad_shape = self._get_pad_shape(data)
 
@@ -74,5 +78,17 @@ class Det3DDataPreprocessor_(Det3DDataPreprocessor):
                 for batch_aug in self.batch_augments:
                     imgs, data_samples = batch_aug(imgs, data_samples)
             batch_inputs['imgs'] = imgs
+
+        preprocessor_ms = round(
+            (time.perf_counter() - preprocessor_start) * 1000.0, 3)
+        preprocessor_end_ts = time.time()
+        if data_samples is not None:
+            for data_sample in data_samples:
+                profiling_info = dict(
+                    data_sample.metainfo.get('profiling_info', {}))
+                profiling_info['data_preprocessor_ms'] = preprocessor_ms
+                profiling_info['data_preprocessor_end_ts'] = \
+                    preprocessor_end_ts
+                data_sample.set_metainfo({'profiling_info': profiling_info})
 
         return {'inputs': batch_inputs, 'data_samples': data_samples}

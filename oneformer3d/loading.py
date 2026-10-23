@@ -1,11 +1,35 @@
 # Adapted from mmdet3d/datasets/transforms/loading.py
 import mmengine
 import numpy as np
+import time
 
+from mmdet3d.datasets.transforms import LoadPointsFromFile
 from mmdet3d.datasets.transforms import LoadAnnotations3D
 from mmdet3d.datasets.transforms.loading import get
 from mmdet3d.datasets.transforms.loading import NormalizePointsColor
 from mmdet3d.registry import TRANSFORMS
+
+
+def _ensure_profiling_info(results):
+    profiling_info = results.get('_profiling_info')
+    if profiling_info is None:
+        profiling_info = {}
+        results['_profiling_info'] = profiling_info
+    return profiling_info
+
+
+@TRANSFORMS.register_module()
+class TimedLoadPointsFromFile_(LoadPointsFromFile):
+    """Load points and stamp wall-clock timing metadata for inference."""
+
+    def transform(self, results: dict) -> dict:
+        profiling_info = _ensure_profiling_info(results)
+        profiling_info.setdefault('pipeline_wall_clock_start_ts', time.time())
+        stage_start = time.perf_counter()
+        results = super().transform(results)
+        profiling_info['load_points_ms'] = round(
+            (time.perf_counter() - stage_start) * 1000.0, 3)
+        return results
 
 
 @TRANSFORMS.register_module()

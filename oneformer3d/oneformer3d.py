@@ -1,6 +1,7 @@
 import torch
 import torch.nn.functional as F
 import spconv.pytorch as spconv
+import pandas as pd
 from torch_scatter import scatter_mean, scatter_add
 import MinkowskiEngine as ME
 
@@ -27,6 +28,191 @@ from plyfile import PlyData, PlyElement
 
 import contextlib, time
 
+
+def _synchronize_for_timing():
+    """Synchronize CUDA before timing boundaries when profiling is enabled."""
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+
+
+def _normalize_csv_value(value):
+    if isinstance(value, float):
+        return round(value, 3)
+    return value
+
+
+def _append_row_to_csv(csv_path, row):
+    directory = os.path.dirname(csv_path)
+    if directory:
+        os.makedirs(directory, exist_ok=True)
+
+    normalized_row = {
+        key: _normalize_csv_value(value)
+        for key, value in row.items()
+    }
+
+    if os.path.exists(csv_path):
+        existing_df = pd.read_csv(csv_path)
+    else:
+        existing_df = pd.DataFrame()
+
+    row_df = pd.DataFrame([normalized_row])
+    all_columns = list(existing_df.columns)
+    for column in row_df.columns:
+        if column not in all_columns:
+            all_columns.append(column)
+
+    if existing_df.empty and not list(existing_df.columns):
+        combined_df = row_df
+    else:
+        existing_df = existing_df.reindex(columns=all_columns)
+        row_df = row_df.reindex(columns=all_columns)
+        combined_df = pd.concat([existing_df, row_df], ignore_index=True)
+
+    combined_df.to_csv(csv_path, index=False)
+
+
+class _InferenceProfiler:
+    """Small opt-in profiler for scene and region level inference stages."""
+
+    def __init__(self,
+                 enabled=False,
+                 scene_name=None,
+                 log_to_stdout=False,
+                 csv_path=None):
+        self.enabled = enabled
+        self.scene_name = scene_name
+        self.log_to_stdout = log_to_stdout
+        self.csv_path = csv_path
+        self.stage_times = collections.OrderedDict()
+        self.region_stage_times = collections.OrderedDict()
+
+    @contextlib.contextmanager
+    def profile(self, name, *, region=False):
+        if not self.enabled:
+            yield
+            return
+        _synchronize_for_timing()
+        start = time.perf_counter()
+        try:
+            yield
+        finally:
+            _synchronize_for_timing()
+            duration = time.perf_counter() - start
+            self.add_time(name, duration, region=region)
+
+    def add_time(self, name, duration, *, region=False):
+        if not self.enabled:
+            return
+        target = self.region_stage_times if region else self.stage_times
+        target[name] = target.get(name, 0.0) + float(duration)
+
+    def build_report(self):
+        if not self.enabled:
+            return None
+
+        total_scene_time = float(sum(self.stage_times.values()))
+        report = {
+            'scene_name': self.scene_name,
+            'scene_total_s': round(total_scene_time, 3),
+            'scene_stages_s': {
+                key: round(value, 3)
+                for key, value in self.stage_times.items()
+            },
+            'region_stages_s': {
+                key: round(value, 3)
+                for key, value in self.region_stage_times.items()
+            }
+        }
+
+        if self.log_to_stdout:
+            print(f"[InferenceProfile] {self.scene_name}: {report}")
+
+        self._write_csv_reports(report)
+        return report
+
+    def _write_csv_reports(self, report):
+        if self.csv_path:
+            _append_row_to_csv(self.csv_path, self._flatten_scene_report(report))
+
+    def _flatten_scene_report(self, report):
+        row = {
+            'scene_name': report['scene_name'],
+            'scene_total_s': report['scene_total_s'],
+        }
+        for key, value in report.get('scene_stages_s', {}).items():
+            row[f'scene_stage_{key}_s'] = value
+        for key, value in report.get('region_stages_s', {}).items():
+            row[f'region_stage_{key}_s'] = value
+        return row
+
+
+def _make_inference_profiler(test_cfg, scene_name):
+    profiling_cfg = {}
+    if test_cfg is not None and hasattr(test_cfg, 'get'):
+        profiling_cfg = test_cfg.get('profiling', {}) or {}
+
+    outdir = profiling_cfg.get('csv_path', 'work_dirs/inference_profile.csv')
+
+    return _InferenceProfiler(
+        enabled=bool(profiling_cfg.get('enabled', False)),
+        scene_name=scene_name,
+        log_to_stdout=bool(profiling_cfg.get('log_to_stdout', False)),
+        csv_path=profiling_cfg.get('csv_path', 'work_dirs/inference_profile.csv'))
+
+
+def _profiling_profile(profiler, name, *, region=False):
+    if profiler is None:
+        return contextlib.nullcontext()
+    return profiler.profile(name, region=region)
+
+
+def _get_sample_profiling_info(data_sample):
+    metainfo = getattr(data_sample, 'metainfo', {})
+    profiling_info = metainfo.get('profiling_info', {})
+    if isinstance(profiling_info, dict):
+        return dict(profiling_info)
+    return {}
+
+
+def _add_wall_clock_timings(profiler, data_sample,
+                            predict_wall_clock_start_ts,
+                            output_wall_clock_end_ts):
+    if profiler is None or not profiler.enabled:
+        return
+
+    profiling_info = _get_sample_profiling_info(data_sample)
+    if not profiling_info:
+        return
+
+    pipeline_start_ts = profiling_info.get('pipeline_wall_clock_start_ts')
+    pipeline_end_ts = profiling_info.get('pipeline_wall_clock_end_ts')
+    preprocessor_end_ts = profiling_info.get('data_preprocessor_end_ts')
+
+    for key in ('load_points_ms', 'pack_inputs_ms', 'data_preprocessor_ms'):
+        if key in profiling_info:
+            profiler.add_time(key.removesuffix('_ms'), profiling_info[key] / 1000.0)
+
+    if pipeline_start_ts is not None and pipeline_end_ts is not None:
+        profiler.add_time(
+            'pipeline_wall_clock',
+            pipeline_end_ts - pipeline_start_ts)
+    if pipeline_end_ts is not None:
+        profiler.add_time(
+            'pipeline_to_predict_gap',
+            predict_wall_clock_start_ts - pipeline_end_ts)
+    if preprocessor_end_ts is not None:
+        profiler.add_time(
+            'preprocessor_to_predict_gap',
+            predict_wall_clock_start_ts - preprocessor_end_ts)
+    profiler.add_time(
+        'predict_wall_clock',
+        output_wall_clock_end_ts - predict_wall_clock_start_ts)
+    if pipeline_start_ts is not None:
+        profiler.add_time(
+            'end_to_end_wall_clock',
+            output_wall_clock_end_ts - pipeline_start_ts)
+
 class UnionFind:
     def __init__(self, n):
         self.parent = list(range(n))
@@ -52,7 +238,7 @@ class UnionFind:
 class ScanNetOneFormer3DMixin:
     """Class contains common methods for ScanNet and ScanNet200."""
 
-    def predict_by_feat(self, out, superpoints):
+    def predict_by_feat(self, out, superpoints, profiler=None):
         """Predict instance, semantic, and panoptic masks for a single scene.
 
         Args:
@@ -67,10 +253,13 @@ class ScanNetOneFormer3DMixin:
             List[PointData]: of len 1 with `pts_semantic_mask`,
                 `pts_instance_mask`, `instance_labels`, `instance_scores`.
         """
-        inst_res = self.predict_by_feat_instance(
-            out, superpoints, self.test_cfg.inst_score_thr)
-        sem_res = self.predict_by_feat_semantic(out, superpoints)
-        pan_res = self.predict_by_feat_panoptic(out, superpoints)
+        with _profiling_profile(profiler, 'instance_head'):
+            inst_res = self.predict_by_feat_instance(
+                out, superpoints, self.test_cfg.inst_score_thr)
+        with _profiling_profile(profiler, 'semantic_head'):
+            sem_res = self.predict_by_feat_semantic(out, superpoints)
+        with _profiling_profile(profiler, 'panoptic_head'):
+            pan_res = self.predict_by_feat_panoptic(out, superpoints)
 
         pts_semantic_mask = [sem_res.cpu().numpy(), pan_res[0].cpu().numpy()]
         pts_instance_mask = [inst_res[0].cpu().bool().numpy(),
@@ -700,166 +889,194 @@ class ForAINetV2OneFormer3D(Base3DDetector):
         lidar_path = batch_data_samples[0].lidar_path
         base_name = os.path.basename(lidar_path)
         current_filename = os.path.splitext(base_name)[0]
+        profiler = _make_inference_profiler(self.test_cfg, current_filename)
+        predict_wall_clock_start_ts = time.time()
         #if 'val' in lidar_path:
         if 'test' in lidar_path:
-            import numpy as np
-            from sklearn.neighbors import NearestNeighbors
-            from plyfile import PlyData, PlyElement
-            from tqdm import tqdm
-            step_size = self.radius
-            grid_size = 0.2
-            num_points = 640000
-            pts_semantic_gt = batch_data_samples[0].eval_ann_info['pts_semantic_mask']
-            pts_instance_gt = batch_data_samples[0].eval_ann_info['pts_instance_mask']
-            original_points = batch_inputs_dict['points'][0]
-            regions = self.generate_cylindrical_regions(original_points, self.radius, step_size)
-            all_pre_sem = [list() for _ in range(original_points.shape[0])]
-            all_pre_ins = np.full(original_points.shape[0], -1)
-            max_instance = 0
+            with profiler.profile('preprocessing'):
+                step_size = self.radius
+                grid_size = 0.2
+                num_points = 640000
+                pts_semantic_gt = batch_data_samples[0].eval_ann_info['pts_semantic_mask']
+                pts_instance_gt = batch_data_samples[0].eval_ann_info['pts_instance_mask']
+                original_points = batch_inputs_dict['points'][0]
+                regions = self.generate_cylindrical_regions(original_points, self.radius, step_size)
+                all_pre_sem = [list() for _ in range(original_points.shape[0])]
+                all_pre_ins = np.full(original_points.shape[0], -1)
+                max_instance = 0
 
-            global_instance_scores = np.zeros((original_points.shape[0],), dtype=float) 
-
+            global_instance_scores = np.zeros((original_points.shape[0],), dtype=float)
             best_masks = []
 
             for region_idx, region in enumerate(tqdm(regions, desc="Processing regions")):
-                region_mask = ((original_points[:, 0] - region[0]) ** 2 + (original_points[:, 1] - region[1]) ** 2) <= self.radius ** 2
-                pc1 = original_points[region_mask]
-                pc1_indices = torch.where(region_mask)[0]
+                with profiler.profile('region_cropping', region=True):
+                    region_mask = ((original_points[:, 0] - region[0]) ** 2 +
+                                   (original_points[:, 1] - region[1]) ** 2) <= self.radius ** 2
+                    pc1 = original_points[region_mask]
+                    pc1_indices = torch.where(region_mask)[0]
 
-                if len(pc1) == 0:
-                    continue
+                    if len(pc1) == 0:
+                        continue
 
-                pc2, pc2_indices = self.grid_sample(pc1, pc1_indices, grid_size)
-                if len(pc2) < num_points:
-                    pc3 = pc2
-                    pc3_indices = pc2_indices
-                elif len(pc2) > num_points:
-                    pc3, pc3_indices = self.points_random_sampling(pc2, pc2_indices, num_points)
+                with profiler.profile('voxel_downsampling', region=True):
+                    pc2, pc2_indices = self.grid_sample(pc1, pc1_indices, grid_size)
+                with profiler.profile('random_downsampling', region=True):
+                    if len(pc2) < num_points:
+                        pc3 = pc2
+                        pc3_indices = pc2_indices
+                    elif len(pc2) > num_points:
+                        pc3, pc3_indices = self.points_random_sampling(pc2, pc2_indices, num_points)
+                    else:
+                        pc3 = pc2
+                        pc3_indices = pc2_indices
 
-                coordinates, features, inverse_mapping2, spatial_shape = self.collate([pc3])
-                x = spconv.SparseConvTensor(features, coordinates, spatial_shape, len(batch_data_samples))
-                x = self.extract_feat(x)
-                x = self.decoder(x)
-                results_list = self.predict_by_feat_test(x, inverse_mapping2, pc3)
-                
+                with profiler.profile('collate', region=True):
+                    coordinates, features, inverse_mapping2, spatial_shape = self.collate([pc3])
+                with profiler.profile('region_sparse_tensor', region=True):
+                    x = spconv.SparseConvTensor(features, coordinates, spatial_shape, len(batch_data_samples))
+                with profiler.profile('backbone_forward', region=True):
+                    x = self.extract_feat(x)
+                with profiler.profile('query_decoder_forward', region=True):
+                    x = self.decoder(x)
+                with profiler.profile('forward_prediction_heads', region=True):
+                    results_list = self.predict_by_feat_test(
+                        x, inverse_mapping2, pc3, profiler=profiler)
+
                 # Collect masks and their scores, process them immediately
-                masks = results_list[0].pts_instance_mask[0]
-                scores = results_list[0].instance_scores
-                valid_scores_mask = scores > 0.6
-                masks = masks[valid_scores_mask]
-                scores = scores[valid_scores_mask]
+                with profiler.profile('instance_mask_postprocessing', region=True):
+                    masks = results_list[0].pts_instance_mask[0]
+                    scores = results_list[0].instance_scores
+                    valid_scores_mask = scores > 0.6
+                    masks = masks[valid_scores_mask]
+                    scores = scores[valid_scores_mask]
 
-                # Nearest neighbor mapping for masks to pc1
-                for mask, score in zip(masks, scores):
-                    mask_pc1 = self.nearest_neighbor_mapping(pc1, pc3, mask)
-                    mask_points = pc1_indices[mask_pc1].cpu().numpy()
+                    # Nearest neighbor mapping for masks to pc1
+                    for mask, score in zip(masks, scores):
+                        mask_pc1 = self.nearest_neighbor_mapping(pc1, pc3, mask)
+                        mask_points = pc1_indices[mask_pc1].cpu().numpy()
 
-                    # Vectorized update of global instance mask and scores
-                    update_mask = score > global_instance_scores[mask_points]
-                    global_instance_scores[mask_points[update_mask]] = score
-                    all_pre_ins[mask_points[update_mask]] = max_instance
+                        # Vectorized update of global instance mask and scores
+                        update_mask = score > global_instance_scores[mask_points]
+                        global_instance_scores[mask_points[update_mask]] = score
+                        all_pre_ins[mask_points[update_mask]] = max_instance
 
-                    if np.any(update_mask):
-                        # Add the new mask
-                        best_masks.append((mask_points, max_instance, score))
+                        if np.any(update_mask):
+                            # Add the new mask
+                            best_masks.append((mask_points, max_instance, score))
 
-                    max_instance += 1
+                        max_instance += 1
 
-                cylinder_current_semantic_pre = self.nearest_neighbor_mapping(pc1, pc3, results_list[0].pts_semantic_mask[0])
-                 
-                originids = torch.where(region_mask)[0].cpu().numpy()  # Move to CPU before using np.where
-                all_pre_sem = self.vote_semantic_labels(all_pre_sem, originids, cylinder_current_semantic_pre)
+                with profiler.profile('semantic_label_upsampling', region=True):
+                    cylinder_current_semantic_pre = self.nearest_neighbor_mapping(
+                        pc1, pc3, results_list[0].pts_semantic_mask[0])
 
-                originids = pc3_indices.cpu().numpy()  # Use pc3_indices for ground truth labels
+                with profiler.profile('semantic_label_voting', region=True):
+                    originids = torch.where(region_mask)[0].cpu().numpy()
+                    all_pre_sem = self.vote_semantic_labels(
+                        all_pre_sem, originids, cylinder_current_semantic_pre)
+
+                originids = pc3_indices.cpu().numpy()
                 # Get gt labels for pc3
                 pc3_semantic_gt = pts_semantic_gt[originids]
                 pc3_instance_gt = pts_instance_gt[originids]
-                # Save each pc3 to a separate .ply file
-                #region_dir = f"/workspace/work_dirs/oneformer3d_radius20_e2039_test_bm2/{current_filename}/region_{region_idx}"
-                #region_ply_path = os.path.join(region_dir, "pc_ins_sem.ply")
-                #self.save_ply(pc3.cpu().numpy(), results_list[0].pts_semantic_mask[0], results_list[0].pts_instance_mask[1], region_ply_path, pc3_semantic_gt, pc3_instance_gt)
 
+            # Save each pc3 to a separate .ply file
+            #region_dir = f"/workspace/work_dirs/oneformer3d_radius20_e2039_test_bm2/{current_filename}/region_{region_idx}"
+            #region_ply_path = os.path.join(region_dir, "pc_ins_sem.ply")
+            #self.save_ply(pc3.cpu().numpy(), results_list[0].pts_semantic_mask[0], results_list[0].pts_instance_mask[1], region_ply_path, pc3_semantic_gt, pc3_instance_gt)
 
-                # Save each mask to a separate .ply file
-                #for mask_idx, (mask, score) in enumerate(zip(results_list[0].pts_instance_mask[0], results_list[0].instance_scores)):
-                #    if score > 0.4:
-                #        mask_points = pc3.cpu().numpy()[mask]
-                #        mask_file_path = os.path.join(region_dir, f"mask{mask_idx}_{score:.2f}.ply")
-                #        self.save_ply_2(mask_points, np.full(mask_points.shape[0], mask_idx), mask_file_path)
+            # Save each mask to a separate .ply file
+            #for mask_idx, (mask, score) in enumerate(zip(results_list[0].pts_instance_mask[0], results_list[0].instance_scores)):
+            #    if score > 0.4:
+            #        mask_points = pc3.cpu().numpy()[mask]
+            #        mask_file_path = os.path.join(region_dir, f"mask{mask_idx}_{score:.2f}.ply")
+            #        self.save_ply_2(mask_points, np.full(mask_points.shape[0], mask_idx), mask_file_path)
 
-
-                # Save the intermediate results
-                #region_ply_path = os.path.join(region_dir, "complete_ins_pre.ply")
-                #self.save_ply_2_withscore(original_points.cpu().numpy(), all_pre_ins, region_ply_path, global_instance_scores)
-
-            # Post-processing step
             final_semantic_labels = self.finalize_semantic_labels(all_pre_sem)
             ground_mask = (final_semantic_labels == 0)
             all_pre_ins[ground_mask] = -1
 
-            # Remove instances with fewer than 10 points
-            unique_instances, instance_counts = np.unique(all_pre_ins, return_counts=True)
-            small_instances = unique_instances[instance_counts < 10]
-            for instance in small_instances:
-                all_pre_ins[all_pre_ins == instance] = -1
+            with profiler.profile('filter_small_instances'):
+                unique_instances, instance_counts = np.unique(all_pre_ins, return_counts=True)
+                small_instances = unique_instances[instance_counts < 10]
+                for instance in small_instances:
+                    all_pre_ins[all_pre_ins == instance] = -1
 
-            # Remove replaced old masks
-            unique_best_masks = []
-            for mask_points, instance_id, score in best_masks:
-                if np.any(all_pre_ins[mask_points] == instance_id):
-                    unique_best_masks.append((mask_points, instance_id, score))
+            with profiler.profile('filter_replaced_masks'):
+                unique_best_masks = []
+                for mask_points, instance_id, score in best_masks:
+                    if np.any(all_pre_ins[mask_points] == instance_id):
+                        unique_best_masks.append((mask_points, instance_id, score))
 
-            # Save the best masks
-            #best_mask_dir = f"/workspace/work_dirs/oneformer3d_radius16_qp300_e2675_test_bm1_austrian/{current_filename}/best_masks_before_block_merge"
-            #os.makedirs(best_mask_dir, exist_ok=True)
-            #for mask_points, instance_id, score in unique_best_masks:
-            #    mask_file_path = os.path.join(best_mask_dir, f"best_mask_{instance_id}_{score}.ply")
-            #    self.save_ply_2_withscore(original_points[mask_points], np.full(mask_points.shape[0], instance_id), mask_file_path, global_instance_scores[mask_points])
+            with profiler.profile('merge_overlapping_instances'):
+                clean_all_pre_ins, merged_masks = self.merge_overlapping_instances_by_score(
+                    all_pre_ins, unique_best_masks)
 
-            # Merge masks
-            #clean_all_pre_ins, merged_masks = self.merge_overlapping_instances(all_pre_ins, unique_best_masks)
-            clean_all_pre_ins, merged_masks = self.merge_overlapping_instances_by_score(all_pre_ins, unique_best_masks)
+            with profiler.profile('relabel_instances'):
+                # Save the masks after block merge
+                #best_mask_after_merge_dir = f"/workspace/work_dirs/oneformer3d_radius16_qp300_e2675_test_bm1_austrian/{current_filename}/best_masks_after_block_merge"
+                #os.makedirs(best_mask_after_merge_dir, exist_ok=True)
+                #for mask_points, instance_id, score in merged_masks:
+                #    mask_file_path = os.path.join(best_mask_after_merge_dir, f"best_mask_{instance_id}_{score}.ply")
+                #    self.save_ply_2_withscore(original_points[mask_points], np.full(mask_points.shape[0], instance_id), mask_file_path, global_instance_scores[mask_points])
 
-            # Save the masks after block merge
-            #best_mask_after_merge_dir = f"/workspace/work_dirs/oneformer3d_radius16_qp300_e2675_test_bm1_austrian/{current_filename}/best_masks_after_block_merge"
-            #os.makedirs(best_mask_after_merge_dir, exist_ok=True)
-            #for mask_points, instance_id, score in merged_masks:
-            #    mask_file_path = os.path.join(best_mask_after_merge_dir, f"best_mask_{instance_id}_{score}.ply")
-            #    self.save_ply_2_withscore(original_points[mask_points], np.full(mask_points.shape[0], instance_id), mask_file_path, global_instance_scores[mask_points])
-
-            # Re-label instances to ensure continuous labeling
-            unique_labels = np.unique(clean_all_pre_ins)
-            unique_labels = unique_labels[unique_labels >= 0]  # Exclude background label (-1)
-            relabel_map = {old_label: new_label for new_label, old_label in enumerate(unique_labels)}
-            relabel_map[-1] = -1  # Keep background as -1
-            clean_all_pre_ins = np.vectorize(relabel_map.get)(clean_all_pre_ins)
+                # Re-label instances to ensure continuous labeling
+                unique_labels = np.unique(clean_all_pre_ins)
+                unique_labels = unique_labels[unique_labels >= 0]
+                relabel_map = {old_label: new_label for new_label, old_label in enumerate(unique_labels)}
+                relabel_map[-1] = -1  # Keep background as -1
+                clean_all_pre_ins = np.vectorize(relabel_map.get)(clean_all_pre_ins)
 
             # Save the final combined results
             region_path = f"/workspace/work_dirs/oneformer3d_radius16_qp300_e2675_test_bm1_austrian/{current_filename}_final_results.ply"
-            self.save_ply_withscore(original_points.cpu().numpy(), final_semantic_labels, clean_all_pre_ins, global_instance_scores, region_path, pts_semantic_gt, pts_instance_gt)
-            
+            with profiler.profile('save_final_results'):
+                self.save_ply_withscore(
+                    original_points.cpu().numpy(), final_semantic_labels,
+                    clean_all_pre_ins, global_instance_scores, region_path,
+                    pts_semantic_gt, pts_instance_gt)
+            _add_wall_clock_timings(
+                profiler, batch_data_samples[0], predict_wall_clock_start_ts,
+                time.time())
+            profile_report = profiler.build_report()
+
             for i, data_sample in enumerate(batch_data_samples):
                 data_sample.pred_pts_seg = results_list[i]
                 data_sample.pred_pts_seg['originids'] = originids
+                if profile_report is not None:
+                    data_sample.pred_pts_seg['inference_profile'] = profile_report
+
             return batch_data_samples
         else:
-            coordinates, features, inverse_mapping, spatial_shape = self.collate(
-                batch_inputs_dict['points'])
-            x = spconv.SparseConvTensor(
-                features, coordinates, spatial_shape, len(batch_data_samples))
+            with profiler.profile('collate'):
+                coordinates, features, inverse_mapping, spatial_shape = self.collate(
+                    batch_inputs_dict['points'])
+            with profiler.profile('sparse_tensor'):
+                x = spconv.SparseConvTensor(
+                    features, coordinates, spatial_shape, len(batch_data_samples))
 
-            x = self.extract_feat(x)
+            with profiler.profile('backbone'):
+                x = self.extract_feat(x)
 
-            x = self.decoder(x)
+            with profiler.profile('decoder'):
+                x = self.decoder(x)
 
-            results_list = self.predict_by_feat(x, inverse_mapping)
+            with profiler.profile('prediction_heads'):
+                results_list = self.predict_by_feat(
+                    x, inverse_mapping, profiler=profiler)
+            _add_wall_clock_timings(
+                profiler, batch_data_samples[0], predict_wall_clock_start_ts,
+                time.time())
+            profile_report = profiler.build_report()
+            print(profile_report)
 
             for i, data_sample in enumerate(batch_data_samples):
                 data_sample.pred_pts_seg = results_list[i]
+                if profile_report is not None:
+                    data_sample.pred_pts_seg['inference_profile'] = profile_report
 
             return batch_data_samples
 
-    def predict_by_feat(self, out, superpoints):
+    def predict_by_feat(self, out, superpoints, profiler=None):
         """Predict instance, semantic, and panoptic masks for a single scene.
 
         Args:
@@ -876,14 +1093,17 @@ class ForAINetV2OneFormer3D(Base3DDetector):
         pred_masks = out['masks'][0]
         pred_scores = out['scores'][0]
 
-        sem_res = self.pred_sem(pred_masks[-self.test_cfg.num_sem_cls:, :],
-                                superpoints)
+        with _profiling_profile(profiler, 'semantic_head'):
+            sem_res = self.pred_sem(pred_masks[-self.test_cfg.num_sem_cls:, :],
+                                    superpoints)
         
-        inst_res = self.pred_inst_sem(pred_masks[:-self.test_cfg.num_sem_cls, :],
-                                  pred_scores[:-self.test_cfg.num_sem_cls, :],
-                                  superpoints, self.test_cfg.inst_score_thr, sem_res)
-        pan_res = self.pred_pan(pred_masks, pred_scores,
-                                superpoints, sem_res)
+        with _profiling_profile(profiler, 'instance_head'):
+            inst_res = self.pred_inst_sem(pred_masks[:-self.test_cfg.num_sem_cls, :],
+                                      pred_scores[:-self.test_cfg.num_sem_cls, :],
+                                      superpoints, self.test_cfg.inst_score_thr, sem_res)
+        with _profiling_profile(profiler, 'panoptic_head'):
+            pan_res = self.pred_pan(pred_masks, pred_scores,
+                                    superpoints, sem_res)
 
         pts_semantic_mask = [sem_res.cpu().numpy(), pan_res[0].cpu().numpy()]
         pts_instance_mask = [inst_res[0].cpu().bool().numpy(),
@@ -896,7 +1116,8 @@ class ForAINetV2OneFormer3D(Base3DDetector):
                 instance_labels=inst_res[1].cpu().numpy(),
                 instance_scores=inst_res[2].cpu().numpy())]
 
-    def predict_by_feat_test(self, out, superpoints, coordinates):
+    def predict_by_feat_test(self, out, superpoints, coordinates,
+                             profiler=None):
         """Predict instance, semantic, and panoptic masks for a single scene.
 
         Args:
@@ -913,19 +1134,25 @@ class ForAINetV2OneFormer3D(Base3DDetector):
         pred_masks = out['masks'][0]
         pred_scores = out['scores'][0]
 
-        sem_res = self.pred_sem(pred_masks[-self.test_cfg.num_sem_cls:, :],
-                                superpoints)
+        with _profiling_profile(profiler, 'forward_semantic_head',
+                                region=profiler is not None):
+            sem_res = self.pred_sem(pred_masks[-self.test_cfg.num_sem_cls:, :],
+                                    superpoints)
         
-        # Calculate ground_z_max from coordinates of points classified as ground
-        ground_points = coordinates[sem_res == 0]
-        ground_z_max = ground_points[:, 2].max().item() if ground_points.size(0) > 0 else float('inf')
+        with _profiling_profile(profiler, 'ground_height_estimation',
+                                region=profiler is not None):
+            ground_points = coordinates[sem_res == 0]
+            ground_z_max = ground_points[:, 2].max().item() if ground_points.size(0) > 0 else float('inf')
 
-        
-        inst_res = self.pred_inst_sem_test(pred_masks[:-self.test_cfg.num_sem_cls, :],
-                                  pred_scores[:-self.test_cfg.num_sem_cls, :],
-                                  superpoints, self.test_cfg.inst_score_thr, sem_res, coordinates, ground_z_max)
-        pan_res = self.pred_pan_sem(pred_masks, pred_scores, 
-                                superpoints, sem_res, coordinates, ground_z_max)
+        with _profiling_profile(profiler, 'forward_instance_head',
+                                region=profiler is not None):
+            inst_res = self.pred_inst_sem_test(pred_masks[:-self.test_cfg.num_sem_cls, :],
+                                      pred_scores[:-self.test_cfg.num_sem_cls, :],
+                                      superpoints, self.test_cfg.inst_score_thr, sem_res, coordinates, ground_z_max)
+        with _profiling_profile(profiler, 'forward_panoptic_head',
+                                region=profiler is not None):
+            pan_res = self.pred_pan_sem(pred_masks, pred_scores, 
+                                    superpoints, sem_res, coordinates, ground_z_max)
 
         pts_semantic_mask = [sem_res.cpu().numpy(), pan_res[0].cpu().numpy()]
         pts_instance_mask = [inst_res[0].cpu().bool().numpy(),
@@ -2159,7 +2386,9 @@ class ForAINetV2OneFormer3D_XAwarequery(Base3DDetector):
                     queries.append(x[0][selected_indices_case4])
                     
                     x = self.decoder(x, queries)
-                    results_list = self.predict_by_feat_test(x, inverse_mapping2, pc3, selected_indices_case4)
+                    results_list = self.predict_by_feat_test(
+                        x, inverse_mapping2, pc3, selected_indices_case4,
+                        profiler=profiler)
                     
                     # Collect masks and their scores, process them immediately
                     masks = results_list[0].pts_instance_mask[0]
@@ -2263,31 +2492,38 @@ class ForAINetV2OneFormer3D_XAwarequery(Base3DDetector):
         lidar_path = batch_data_samples[0].lidar_path
         base_name = os.path.basename(lidar_path)
         current_filename = os.path.splitext(base_name)[0]
+        profiler = _make_inference_profiler(self.test_cfg, current_filename)
+        predict_wall_clock_start_ts = time.time()
         t1 = time.time()                 
-        #########print(f"load pc: {(t1 - t0)*1000:.0f} ms")
+        #########
+        print(f"load pc: {(t1 - t0)*1000:.0f} ms")
         #is_test = True
         #if is_test:
         if 'test' in lidar_path:
-            step_size = self.radius/4
-            grid_size = 0.2
-            num_points = 640000
-            pts_semantic_gt = batch_data_samples[0].eval_ann_info['pts_semantic_mask']
-            pts_instance_gt = batch_data_samples[0].eval_ann_info['pts_instance_mask']
-            original_points = batch_inputs_dict['points'][0]
-            regions = self.generate_cylindrical_regions(original_points, self.radius, step_size)
-            num_cls = self.test_cfg.num_sem_cls        
-            votes_counter = np.zeros(                    # (N_total, num_cls)
-                (original_points.shape[0], num_cls),
-                dtype=np.int16
-            )
-            all_pre_ins = np.full(original_points.shape[0], -1)
-            max_instance = 0
+            with profiler.profile('data_preprocessing'):
+                step_size = self.radius/4
+                grid_size = 0.2
+                num_points = 640000
+                pts_semantic_gt = batch_data_samples[0].eval_ann_info['pts_semantic_mask']
+                pts_instance_gt = batch_data_samples[0].eval_ann_info['pts_instance_mask']
+                original_points = batch_inputs_dict['points'][0]
+                regions = self.generate_cylindrical_regions(
+                    original_points, self.radius, step_size)
 
-            global_instance_scores = np.zeros((original_points.shape[0],), dtype=float) 
+            with profiler.profile('initialization'):
+                num_cls = self.test_cfg.num_sem_cls        
+                votes_counter = np.zeros(                    # (N_total, num_cls)
+                    (original_points.shape[0], num_cls),
+                    dtype=np.int16
+                )
+                all_pre_ins = np.full(original_points.shape[0], -1)
+                max_instance = 0
 
-            best_masks = []
+                global_instance_scores = np.zeros((original_points.shape[0],), dtype=float) 
 
-            all_instance_labels = set(np.unique(pts_instance_gt))
+                best_masks = []
+
+                all_instance_labels = set(np.unique(pts_instance_gt))
             
             ##########output_path = "/workspace/work_dirs/bluepoint_th04fixed_03_priority_test_tobedelete"
             #########output_path = "/workspace/work_dirs/bluepoint_forinstancev2"
@@ -2299,191 +2535,206 @@ class ForAINetV2OneFormer3D_XAwarequery(Base3DDetector):
             last_originids = None              
             #########print(f"generate regions: {(t2 - t1)*1000:.0f} ms")
             for region_idx, region in enumerate(tqdm(regions, desc="Processing regions")):
-                t2 = time.time()                 
-                region_mask = ((original_points[:, 0] - region[0]) ** 2 + (original_points[:, 1] - region[1]) ** 2) <= self.radius ** 2
-                pc1 = original_points[region_mask]
-                pc1_indices = torch.where(region_mask)[0]
+                t2 = time.time() 
+                with profiler.profile('region_cropping'):               
+                    region_mask = ((original_points[:, 0] - region[0]) ** 2 + (original_points[:, 1] - region[1]) ** 2) <= self.radius ** 2
+                    pc1 = original_points[region_mask]
+                    pc1_indices = torch.where(region_mask)[0]
                 t3 = time.time()                 
                 #########print(f"generate regions step2: {(t3 - t2)*1000:.0f} ms")
                 if len(pc1) == 0:
                     continue
 
-                pc2, pc2_indices = self.grid_sample(pc1, pc1_indices, grid_size)
+                with profiler.profile('voxel_downsampling'):               
+                    pc2, pc2_indices = self.grid_sample(pc1, pc1_indices, grid_size)
                 t4_1_1 = time.time()                 
                 #########print(f"u net 1--1: {(t4_1_1 - t3)*1000:.0f} ms")
                 if len(pc2) < num_points:
                     pc3 = pc2
                     pc3_indices = pc2_indices
                 elif len(pc2) > num_points:
-                    pc3, pc3_indices = self.points_random_sampling(pc2, pc2_indices, num_points)
+                    with profiler.profile('random_downsampling'):               
+                        pc3, pc3_indices = self.points_random_sampling(pc2, pc2_indices, num_points)
                 
                 t4_1_2 = time.time()                 
                 #########print(f"u net 1--2: {(t4_1_2 - t4_1_1)*1000:.0f} ms")
 
-                coordinates, features, inverse_mapping2, spatial_shape = self.collate([pc3])
-                t4_2 = time.time() 
-                #########print(f"u net 2: {(t4_2 - t4_1_2)*1000:.0f} ms")
-                x = spconv.SparseConvTensor(features, coordinates, spatial_shape, len(batch_data_samples))
+                with profiler.profile('collate'):               
+                    coordinates, features, inverse_mapping2, spatial_shape = self.collate([pc3])
+                    t4_2 = time.time() 
+                with profiler.profile('sparse_tensor_conversion'):
+                    #########print(f"u net 2: {(t4_2 - t4_1_2)*1000:.0f} ms")
+                    x = spconv.SparseConvTensor(features, coordinates, spatial_shape, len(batch_data_samples))
                 t4_3 = time.time() 
                 #########print(f"u net 3: {(t4_3 - t4_2)*1000:.0f} ms")
-                x = self.extract_feat(x)
+                with profiler.profile('backbone_forward'):               
+                    x = self.extract_feat(x)
                 t4_4 = time.time() 
                 #########print(f"u net 4: {(t4_4 - t4_3)*1000:.0f} ms")
-                embed_logits = self.Embed(x[0])
-                bi_semantic_logits = self.BiSemantic(x[0]) 
+                with profiler.profile('auxilliary_forward'):               
+                    embed_logits = self.Embed(x[0])
+                    bi_semantic_logits = self.BiSemantic(x[0]) 
                 
-                wood_class = 1
-                semantic_predictions_bi = torch.argmax(bi_semantic_logits, dim=1)
-                tree_indices = torch.where(semantic_predictions_bi == wood_class)[0]  #all voxel
+                    wood_class = 1
+                    semantic_predictions_bi = torch.argmax(bi_semantic_logits, dim=1)
+                    tree_indices = torch.where(semantic_predictions_bi == wood_class)[0]  #all voxel
                 t5 = time.time()                 
                 #########print(f"u net heads: {(t5 - t4_4)*1000:.0f} ms")  
-                with torch.no_grad():
-                    nn_idx_pc1 = []                
-                    chunk = self.chunk
-                    for ss in range(0, pc1.shape[0], chunk):
-                        ee = min(ss + chunk, pc1.shape[0])
+                with profiler.profile('nearest_neighbor_search'):               
+                    with torch.no_grad():
+                        nn_idx_pc1 = []                
+                        chunk = self.chunk
+                        for ss in range(0, pc1.shape[0], chunk):
+                            ee = min(ss + chunk, pc1.shape[0])
 
-                        neighbor_graph_edge_indices = knn(pc3.float(), pc1[ss:ee].float(), 1)
-                        nn_idx_pc1.append(neighbor_graph_edge_indices[1].flatten())
-                    nn_idx_pc1 = torch.cat(nn_idx_pc1)   # (N_pc1,)  
+                            neighbor_graph_edge_indices = knn(pc3.float(), pc1[ss:ee].float(), 1)
+                            nn_idx_pc1.append(neighbor_graph_edge_indices[1].flatten())
+                        nn_idx_pc1 = torch.cat(nn_idx_pc1)   # (N_pc1,)  
                 if tree_indices.numel() > 1:
-                    
-                    # FPS from all tree points
-                    batch_tensor_4 = torch.zeros(embed_logits[tree_indices].size(0), dtype=torch.long).to(embed_logits.device)  # Ensure batch_tensor on same device
-                    topk_indices_4 = fps(embed_logits[tree_indices], batch_tensor_4, ratio=min(self.query_point_num / embed_logits[tree_indices].size(0), torch.tensor([1.0]).to(embed_logits.device)))
-                    selected_indices_case4 = tree_indices[topk_indices_4]
+                    with profiler.profile('query_decoder_forward'):
+                        # FPS from all tree points
+                        batch_tensor_4 = torch.zeros(embed_logits[tree_indices].size(0), dtype=torch.long).to(embed_logits.device)  # Ensure batch_tensor on same device
+                        with profiler.profile('fps'):
+                            topk_indices_4 = fps(embed_logits[tree_indices], batch_tensor_4, ratio=min(self.query_point_num / embed_logits[tree_indices].size(0), torch.tensor([1.0]).to(embed_logits.device)))
+                        selected_indices_case4 = tree_indices[topk_indices_4]
 
-                    # add content queries
-                    queries = []
-                    queries.append(x[0][selected_indices_case4])
-                    t6 = time.time()                 
-                    #########print(f"generate queries: {(t6 - t5)*1000:.0f} ms")  
-                    x = self.decoder(x, queries)
-                    t7 = time.time()                 
-                    #########print(f"transformer decoder: {(t7 - t6)*1000:.0f} ms")  
-                    results_list = self.predict_by_feat_test(x, inverse_mapping2, pc3, selected_indices_case4)
-                    t7_1 = time.time() 
-                    #########print(f"postprocessing 1 step1: {(t7_1 - t7)*1000:.0f} ms")
-                    # Collect masks and their scores, process them immediately
-                    masks = results_list[0].pts_instance_mask[0]
-                    scores = results_list[0].instance_scores
-                    valid_scores_mask = scores > score_th1
+                        # add content queries
+                        queries = []
+                        queries.append(x[0][selected_indices_case4])
+                        t6 = time.time()                 
+                        #########print(f"generate queries: {(t6 - t5)*1000:.0f} ms")  
+                        with profiler.profile('query_decoder'):
+                            x = self.decoder(x, queries)
+                        t7 = time.time()                 
+                        #########print(f"transformer decoder: {(t7 - t6)*1000:.0f} ms")  
+                        with profiler.profile('predict_by_feat_test'):
+                            results_list = self.predict_by_feat_test(x, inverse_mapping2, pc3, selected_indices_case4, profiler=profiler)
+                        t7_1 = time.time() 
+                    with profiler.profile('instance_mask_postprocessing'):
 
-                    # Prepare region for cylinder edge calculation
-                    center = region  # assuming region is the cylinder's center (x, y)
-                    edge_threshold = self.radius - 0.5  # Distance to cylinder edge threshold (0.5m from the edge)
+                        #########print(f"postprocessing 1 step1: {(t7_1 - t7)*1000:.0f} ms")
+                        # Collect masks and their scores, process them immediately
+                        masks = results_list[0].pts_instance_mask[0]
+                        scores = results_list[0].instance_scores
+                        valid_scores_mask = scores > score_th1
 
-                    # Compute distances to cylinder center for all points
-                    pc3_distances = torch.sqrt((pc3[:, 0] - center[0]) ** 2 + (pc3[:, 1] - center[1]) ** 2)
-                    t7_2 = time.time() 
-                    #########print(f"postprocessing 1 step2: {(t7_2 - t7_1)*1000:.0f} ms")
-                    valid_scores_mask2 = np.ones_like(valid_scores_mask, dtype=bool)  # Initialize mask (all True)
-                    for i, mask in enumerate(masks):
-                        if valid_scores_mask[i]:  # Only check valid masks (with scores > 0.6)
-                            # Check if any point in the mask is too close to the edge
-                            if torch.any(pc3_distances[mask] > edge_threshold):
-                                valid_scores_mask2[i] = False  # Invalidate this mask if any point is near the edge
-                    t8 = time.time()                 
-                    #########print(f"postprocessing 1: {(t8 - t7)*1000:.0f} ms")  
-                    ####### Apply both score and edge distance filtering
-                    '''
-                    final_valid_mask = valid_scores_mask & valid_scores_mask2
+                        # Prepare region for cylinder edge calculation
+                        center = region  # assuming region is the cylinder's center (x, y)
+                        edge_threshold = self.radius - 0.5  # Distance to cylinder edge threshold (0.5m from the edge)
 
-                    masks = masks[final_valid_mask]
-                    scores = scores[final_valid_mask]
+                        # Compute distances to cylinder center for all points
+                        pc3_distances = torch.sqrt((pc3[:, 0] - center[0]) ** 2 + (pc3[:, 1] - center[1]) ** 2)
+                        t7_2 = time.time() 
+                        #########print(f"postprocessing 1 step2: {(t7_2 - t7_1)*1000:.0f} ms")
+                        valid_scores_mask2 = np.ones_like(valid_scores_mask, dtype=bool)  # Initialize mask (all True)
+                        for i, mask in enumerate(masks):
+                            if valid_scores_mask[i]:  # Only check valid masks (with scores > 0.6)
+                                # Check if any point in the mask is too close to the edge
+                                if torch.any(pc3_distances[mask] > edge_threshold):
+                                    valid_scores_mask2[i] = False  # Invalidate this mask if any point is near the edge
+                        t8 = time.time()                 
+                        #########print(f"postprocessing 1: {(t8 - t7)*1000:.0f} ms")  
+                        ####### Apply both score and edge distance filtering
+                        '''
+                        final_valid_mask = valid_scores_mask & valid_scores_mask2
 
-                    # Nearest neighbor mapping for masks to pc1
-                    for mask, score in zip(masks, scores):
-                        mask_pc1 = self.nearest_neighbor_mapping(pc1, pc3, mask)
-                        mask_points = pc1_indices[mask_pc1].cpu().numpy()
+                        masks = masks[final_valid_mask]
+                        scores = scores[final_valid_mask]
 
-                        # Vectorized update of global instance mask and scores
-                        update_mask = score > global_instance_scores[mask_points]
-                        global_instance_scores[mask_points[update_mask]] = score
-                        all_pre_ins[mask_points[update_mask]] = max_instance
+                        # Nearest neighbor mapping for masks to pc1
+                        for mask, score in zip(masks, scores):
+                            mask_pc1 = self.nearest_neighbor_mapping(pc1, pc3, mask)
+                            mask_points = pc1_indices[mask_pc1].cpu().numpy()
 
-                        if np.any(update_mask):
-                            # Add the new mask
-                            best_masks.append((mask_points, max_instance, score))
+                            # Vectorized update of global instance mask and scores
+                            update_mask = score > global_instance_scores[mask_points]
+                            global_instance_scores[mask_points[update_mask]] = score
+                            all_pre_ins[mask_points[update_mask]] = max_instance
 
-                        #max_instance += 1'''
+                            if np.any(update_mask):
+                                # Add the new mask
+                                best_masks.append((mask_points, max_instance, score))
 
-                    keep = torch.where(
-                        torch.tensor(valid_scores_mask, device=pc3.device) &
-                        torch.tensor(valid_scores_mask2, device=pc3.device)
-                    )[0]                                            # (K,)
+                            #max_instance += 1'''
 
-                    if keep.numel():
-                        # mask/score（GPU）
-                        masks_kept  = torch.as_tensor(masks,  device=pc3.device)[keep]   # (K,N3)
-                        scores_kept = torch.as_tensor(scores, device=pc3.device)[keep]   # (K,)
+                        keep = torch.where(
+                            torch.tensor(valid_scores_mask, device=pc3.device) &
+                            torch.tensor(valid_scores_mask2, device=pc3.device)
+                        )[0]                                            # (K,)
 
-                        # ② voxel → pc1   (K, N_pc1)  → COO
-                        mk_bool = masks_kept[:, nn_idx_pc1]             # bool
-                        if mk_bool.numel() > torch.iinfo(torch.int).max * 0.5:
-                            rows = []
-                            cols = []
-                            for row in range(mk_bool.shape[0]):
-                                cols_i = mk_bool[row].nonzero().flatten()
-                                cols.append(cols_i)
-                                rows.extend([row] * len(cols_i))
-                            rows = torch.tensor(rows, device=mk_bool.device, dtype=torch.long)
-                            cols = torch.concatenate(cols)
-                        else:
-                            rows, cols = mk_bool.nonzero(as_tuple=True)
-                        score_per_hit = scores_kept[rows]               # (nnz,)
+                        if keep.numel():
+                            # mask/score（GPU）
+                            masks_kept  = torch.as_tensor(masks,  device=pc3.device)[keep]   # (K,N3)
+                            scores_kept = torch.as_tensor(scores, device=pc3.device)[keep]   # (K,)
 
-                        N1 = pc1.shape[0]
-                        best_score = torch.full((N1,), -1., device=pc3.device)
-                        best_mid   = torch.full((N1,), -1 , dtype=torch.long, device=pc3.device)
+                            # ② voxel → pc1   (K, N_pc1)  → COO
+                            mk_bool = masks_kept[:, nn_idx_pc1]             # bool
+                            if mk_bool.numel() > torch.iinfo(torch.int).max * 0.5:
+                                rows = []
+                                cols = []
+                                for row in range(mk_bool.shape[0]):
+                                    cols_i = mk_bool[row].nonzero().flatten()
+                                    cols.append(cols_i)
+                                    rows.extend([row] * len(cols_i))
+                                rows = torch.tensor(rows, device=mk_bool.device, dtype=torch.long)
+                                cols = torch.concatenate(cols)
+                            else:
+                                rows, cols = mk_bool.nonzero(as_tuple=True)
+                            score_per_hit = scores_kept[rows]               # (nnz,)
 
-                        best_score.index_reduce_(0, cols, score_per_hit, reduce='amax')
-                        improved_mask = score_per_hit == best_score[cols]
-                        best_mid.index_put_((cols[improved_mask],),
-                                            rows[improved_mask], accumulate=False)
+                            N1 = pc1.shape[0]
+                            best_score = torch.full((N1,), -1., device=pc3.device)
+                            best_mid   = torch.full((N1,), -1 , dtype=torch.long, device=pc3.device)
 
-                        pts_glob   = pc1_indices.cpu().numpy()
-                        new_scores = best_score.cpu().numpy()
-                        better_pts = new_scores > global_instance_scores[pts_glob]
+                            best_score.index_reduce_(0, cols, score_per_hit, reduce='amax')
+                            improved_mask = score_per_hit == best_score[cols]
+                            best_mid.index_put_((cols[improved_mask],),
+                                                rows[improved_mask], accumulate=False)
 
-                        if better_pts.any():
-                            global_instance_scores[pts_glob[better_pts]] = new_scores[better_pts]
-                            all_pre_ins[pts_glob[better_pts]] = (
-                                max_instance + best_mid.cpu().numpy()[better_pts]
-                            )
+                            pts_glob   = pc1_indices.cpu().numpy()
+                            new_scores = best_score.cpu().numpy()
+                            better_pts = new_scores > global_instance_scores[pts_glob]
 
-                            mids_unique = np.unique(best_mid.cpu().numpy()[better_pts])
-                            for mid in mids_unique:
-                                sel_pts = (cols[rows == mid]).cpu().numpy()      
-                                best_masks.append(
-                                    (pts_glob[sel_pts],
-                                    max_instance + int(mid),
-                                    float(scores_kept[int(mid)]))
+                            if better_pts.any():
+                                global_instance_scores[pts_glob[better_pts]] = new_scores[better_pts]
+                                all_pre_ins[pts_glob[better_pts]] = (
+                                    max_instance + best_mid.cpu().numpy()[better_pts]
                                 )
 
-                        max_instance += int(masks_kept.size(0))        
-                    t9 = time.time()                 
+                                mids_unique = np.unique(best_mid.cpu().numpy()[better_pts])
+                                for mid in mids_unique:
+                                    sel_pts = (cols[rows == mid]).cpu().numpy()      
+                                    best_masks.append(
+                                        (pts_glob[sel_pts],
+                                        max_instance + int(mid),
+                                        float(scores_kept[int(mid)]))
+                                    )
+
+                            max_instance += int(masks_kept.size(0))        
+                        t9 = time.time()                 
                     #########print(f"postprocessing 2: {(t9 - t8)*1000:.0f} ms")  
                     #cylinder_current_semantic_pre = self.nearest_neighbor_mapping(pc1, pc3, results_list[0].pts_semantic_mask[0])
-                    sem_pred_pc3 = results_list[0].pts_semantic_mask[0]
-                    if isinstance(sem_pred_pc3, np.ndarray):
-                        sem_pred_pc3 = torch.from_numpy(sem_pred_pc3).to(pc3.device)
-                    else:
-                        sem_pred_pc3 = sem_pred_pc3.to(pc3.device)
-                    cylinder_current_semantic_pre = sem_pred_pc3[nn_idx_pc1]
+                    with profiler.profile('semantic_label_postprocessing'):
+                        sem_pred_pc3 = results_list[0].pts_semantic_mask[0]
+                        if isinstance(sem_pred_pc3, np.ndarray):
+                            sem_pred_pc3 = torch.from_numpy(sem_pred_pc3).to(pc3.device)
+                        else:
+                            sem_pred_pc3 = sem_pred_pc3.to(pc3.device)
+                        cylinder_current_semantic_pre = sem_pred_pc3[nn_idx_pc1]
 
-                    #originids = torch.where(region_mask)[0].cpu().numpy()  # Move to CPU before using np.where
-                    #all_pre_sem = self.vote_semantic_labels(all_pre_sem, torch.where(region_mask)[0], cylinder_current_semantic_pre)
-                    ids_np = torch.where(region_mask)[0].cpu().numpy()                 # (N_pc1,)
-                    sem_np = cylinder_current_semantic_pre.cpu().numpy().astype(int)   # (N_pc1,)
+                    with profiler.profile('semantic_label_majority_voting'):
+                        #originids = torch.where(region_mask)[0].cpu().numpy()  # Move to CPU before using np.where
+                        #all_pre_sem = self.vote_semantic_labels(all_pre_sem, torch.where(region_mask)[0], cylinder_current_semantic_pre)
+                        ids_np = torch.where(region_mask)[0].cpu().numpy()                 # (N_pc1,)
+                        sem_np = cylinder_current_semantic_pre.cpu().numpy().astype(int)   # (N_pc1,)
 
-                    np.add.at(votes_counter, (ids_np, sem_np), 1) 
+                        np.add.at(votes_counter, (ids_np, sem_np), 1) 
 
-                    originids = pc3_indices.cpu().numpy()  # Use pc3_indices for ground truth labels
-                    last_results = results_list      
-                    last_originids = originids  
-                    last_batch_len = len(batch_data_samples)      
-                    t10 = time.time()                 
+                        originids = pc3_indices.cpu().numpy()  # Use pc3_indices for ground truth labels
+                        last_results = results_list      
+                        last_originids = originids  
+                        last_batch_len = len(batch_data_samples)      
+                        t10 = time.time()                 
                     #########print(f"postprocessing 3: {(t10 - t9)*1000:.0f} ms") 
                     
                     '''
@@ -2498,22 +2749,24 @@ class ForAINetV2OneFormer3D_XAwarequery(Base3DDetector):
                     self.save_ply(pc3.cpu().numpy(), results_list[0].pts_semantic_mask[0], results_list[0].pts_instance_mask[1], region_ply_path, pc3_semantic_gt, pc3_instance_gt)
                     '''
                 else:
-                    projected_semantic_logits = bi_semantic_logits[inverse_mapping2]
-                    semantic_predictions_pc3 = torch.argmax(projected_semantic_logits, dim=1)
-                    #cylinder_current_semantic_pre = self.nearest_neighbor_mapping(pc1, pc3, semantic_predictions_pc3)
-                    proj_logits   = bi_semantic_logits[inverse_mapping2]         # (N_pc3, C)
-                    sem_pred_pc3  = torch.argmax(proj_logits, dim=1) 
-                    if isinstance(sem_pred_pc3, np.ndarray):
-                        sem_pred_pc3 = torch.from_numpy(sem_pred_pc3).to(pc3.device)
-                    else:
-                        sem_pred_pc3 = sem_pred_pc3.to(pc3.device)
-                    cylinder_current_semantic_pre = sem_pred_pc3[nn_idx_pc1]   
-                    #originids = torch.where(region_mask)[0].cpu().numpy()  # Move to CPU before using np.where
-                    #all_pre_sem = self.vote_semantic_labels(all_pre_sem, torch.where(region_mask)[0], cylinder_current_semantic_pre)                    
-                    ids_np = torch.where(region_mask)[0].cpu().numpy()                 # (N_pc1,)
-                    sem_np = cylinder_current_semantic_pre.cpu().numpy().astype(int)   # (N_pc1,)
+                    with profiler.profile('semantic_label_postprocessing'):
+                        projected_semantic_logits = bi_semantic_logits[inverse_mapping2]
+                        semantic_predictions_pc3 = torch.argmax(projected_semantic_logits, dim=1)
+                        #cylinder_current_semantic_pre = self.nearest_neighbor_mapping(pc1, pc3, semantic_predictions_pc3)
+                        proj_logits   = bi_semantic_logits[inverse_mapping2]         # (N_pc3, C)
+                        sem_pred_pc3  = torch.argmax(proj_logits, dim=1) 
+                        if isinstance(sem_pred_pc3, np.ndarray):
+                            sem_pred_pc3 = torch.from_numpy(sem_pred_pc3).to(pc3.device)
+                        else:
+                            sem_pred_pc3 = sem_pred_pc3.to(pc3.device)
+                        cylinder_current_semantic_pre = sem_pred_pc3[nn_idx_pc1]   
+                    with profiler.profile('semantic_label_majority_voting'):
+                        #originids = torch.where(region_mask)[0].cpu().numpy()  # Move to CPU before using np.where
+                        #all_pre_sem = self.vote_semantic_labels(all_pre_sem, torch.where(region_mask)[0], cylinder_current_semantic_pre)                    
+                        ids_np = torch.where(region_mask)[0].cpu().numpy()                 # (N_pc1,)
+                        sem_np = cylinder_current_semantic_pre.cpu().numpy().astype(int)   # (N_pc1,)
 
-                    np.add.at(votes_counter, (ids_np, sem_np), 1) 
+                        np.add.at(votes_counter, (ids_np, sem_np), 1) 
                     t10 = time.time()                 
                     #########print(f"postprocessing 4: {(t10 - t5)*1000:.0f} ms") 
                 del pc1, pc1_indices, pc2, pc2_indices, pc3, pc3_indices
@@ -2526,11 +2779,11 @@ class ForAINetV2OneFormer3D_XAwarequery(Base3DDetector):
             #final_semantic_labels = self.finalize_semantic_labels_old(all_pre_sem)
             #ground_mask = (final_semantic_labels == 0)
 
-            final_semantic_labels = votes_counter.argmax(1)         # (N_total,)
-            final_semantic_labels[votes_counter.sum(1) == 0] = -1  
-            ground_mask = (final_semantic_labels == 0)
-
-            all_pre_ins[ground_mask] = -1
+            with profiler.profile('finalize_semantic_labels'):
+                final_semantic_labels = votes_counter.argmax(1)
+                final_semantic_labels[votes_counter.sum(1) == 0] = -1
+                ground_mask = (final_semantic_labels == 0)
+                all_pre_ins[ground_mask] = -1
             t11 = time.time()                 
             #print(f"postprocessing 5: {(t11 - t10)*1000:.0f} ms") 
             # Remove instances with fewer than 10 points
@@ -2540,38 +2793,47 @@ class ForAINetV2OneFormer3D_XAwarequery(Base3DDetector):
             #    all_pre_ins[all_pre_ins == instance] = -1
             t11 = time.time()     
             # Remove instances with fewer than 10 points  
-            uniq, cnt = np.unique(all_pre_ins, return_counts=True)
-            to_kill   = np.isin(all_pre_ins, uniq[(cnt < 10) & (uniq != -1)])
-            all_pre_ins[to_kill] = -1
+            with profiler.profile('filter_small_instances'):
+                uniq, cnt = np.unique(all_pre_ins, return_counts=True)
+                to_kill = np.isin(all_pre_ins, uniq[(cnt < 10) & (uniq != -1)])
+                all_pre_ins[to_kill] = -1
             t12 = time.time()
             print(f"postprocessing 6: {(t12 - t11)*1000:.0f} ms")
             # Remove replaced old masks
-            unique_best_masks = []
-            for mask_points, instance_id, score in best_masks:
-                if np.any(all_pre_ins[mask_points] == instance_id):
-                    unique_best_masks.append((mask_points, instance_id, score))
+            with profiler.profile('filter_replaced_masks'):
+                unique_best_masks = []
+                for mask_points, instance_id, score in best_masks:
+                    if np.any(all_pre_ins[mask_points] == instance_id):
+                        unique_best_masks.append((mask_points, instance_id, score))
             t13 = time.time()                 
             print(f"postprocessing 7: {(t13 - t12)*1000:.0f} ms")
 
-            clean_all_pre_ins, merged_masks, merged_instance_scores = self.merge_overlapping_instances_by_score_speedup(all_pre_ins, unique_best_masks,overlap_threshold=score_th2)
+            with profiler.profile('merge_overlapping_instances'):
+                clean_all_pre_ins, merged_masks, merged_instance_scores = self.merge_overlapping_instances_by_score_speedup(all_pre_ins, unique_best_masks,overlap_threshold=score_th2)
             t14 = time.time()                 
             print(f"postprocessing 8: {(t14 - t13)*1000:.0f} ms")
             # Re-label instances to ensure continuous labeling
-            unique_labels = np.unique(clean_all_pre_ins)
-            unique_labels = unique_labels[unique_labels >= 0]  # Exclude background label (-1)
-            relabel_map = {old_label: new_label for new_label, old_label in enumerate(unique_labels)}
-            relabel_map[-1] = -1  # Keep background as -1
-            clean_all_pre_ins = np.vectorize(relabel_map.get)(clean_all_pre_ins)
+            with profiler.profile('relabel_instances'):
+                unique_labels = np.unique(clean_all_pre_ins)
+                unique_labels = unique_labels[unique_labels >= 0]
+                relabel_map = {old_label: new_label for new_label, old_label in enumerate(unique_labels)}
+                relabel_map[-1] = -1
+                clean_all_pre_ins = np.vectorize(relabel_map.get)(clean_all_pre_ins)
             t14 = time.time()                 
             ######print(f"postprocessing 8: {(t14 - t13)*1000:.0f} ms")
             # Save the final combined results
             region_path = os.path.join(output_path, f"{current_filename}.ply")
  
-            self.save_ply_withscore(original_points.cpu().numpy(), final_semantic_labels, clean_all_pre_ins, merged_instance_scores, region_path, pts_semantic_gt, pts_instance_gt)
+            with profiler.profile('save_final_results'):
+                self.save_ply_withscore(original_points.cpu().numpy(), final_semantic_labels, clean_all_pre_ins, merged_instance_scores, region_path, pts_semantic_gt, pts_instance_gt)
             #self.save_bluepoints(original_points.cpu().numpy(), final_semantic_labels, clean_all_pre_ins, merged_instance_scores, region_path, pts_semantic_gt, pts_instance_gt)
-            
+             
             t15 = time.time()                 
             ######print(f"postprocessing 9: {(t15 - t14)*1000:.0f} ms")
+            _add_wall_clock_timings(
+                profiler, batch_data_samples[0], predict_wall_clock_start_ts,
+                time.time())
+            profile_report = profiler.build_report()
             #for i, data_sample in enumerate(batch_data_samples):
             #    data_sample.pred_pts_seg = results_list[i]
             #    data_sample.pred_pts_seg['originids'] = originids
@@ -2580,33 +2842,59 @@ class ForAINetV2OneFormer3D_XAwarequery(Base3DDetector):
                 for i, data_sample in enumerate(batch_data_samples):
                     data_sample.pred_pts_seg = last_results[i]
                     data_sample.pred_pts_seg['originids'] = last_originids
+                    if profile_report is not None:
+                        data_sample.pred_pts_seg['inference_profile'] = \
+                            profile_report
             else:                                      
                 for data_sample in batch_data_samples:
                     data_sample.pred_pts_seg = None
+
+
+            profile_report = profiler.build_report()
+
+            profile_report_df = pd.DataFrame([profile_report])
+            profile_report_df.to_csv("/workspace/data-2/wacv/profile_forest_former_3d/detailed_performance_metrics.csv")
+
             return batch_data_samples
         else:
-            coordinates, features, inverse_mapping, spatial_shape = self.collate(
-                batch_inputs_dict['points'])
-            x = spconv.SparseConvTensor(
-                features, coordinates, spatial_shape, len(batch_data_samples))
+            with profiler.profile('collate'):
+                coordinates, features, inverse_mapping, spatial_shape = self.collate(
+                    batch_inputs_dict['points'])
+            with profiler.profile('sparse_tensor'):
+                x = spconv.SparseConvTensor(
+                    features, coordinates, spatial_shape, len(batch_data_samples))
 
-            x = self.extract_feat(x)
+            with profiler.profile('backbone'):
+                x = self.extract_feat(x)
 
-            queries = []
-            for i in range(len(x)):
-                max_len = min(self.query_point_num, len(x[i]))
-                queries.append(x[i][0:max_len])
+            with profiler.profile('query_selection'):
+                queries = []
+                for i in range(len(x)):
+                    max_len = min(self.query_point_num, len(x[i]))
+                    queries.append(x[i][0:max_len])
             
-            x = self.decoder(x, queries)
+            with profiler.profile('decoder'):
+                x = self.decoder(x, queries)
 
-            results_list = self.predict_by_feat(x, inverse_mapping)
+            with profiler.profile('prediction_heads'):
+                results_list = self.predict_by_feat(
+                    x, inverse_mapping, profiler=profiler)
+            _add_wall_clock_timings(
+                profiler, batch_data_samples[0], predict_wall_clock_start_ts,
+                time.time())
+            profile_report = profiler.build_report()
 
             for i, data_sample in enumerate(batch_data_samples):
                 data_sample.pred_pts_seg = results_list[i]
+                if profile_report is not None:
+                    data_sample.pred_pts_seg['inference_profile'] = \
+                        profile_report
+
+            profile_report = profiler.build_report()
 
             return batch_data_samples
 
-    def predict_by_feat(self, out, superpoints):
+    def predict_by_feat(self, out, superpoints, profiler=None):
         """Predict instance, semantic, and panoptic masks for a single scene.
 
         Args:
@@ -2628,14 +2916,17 @@ class ForAINetV2OneFormer3D_XAwarequery(Base3DDetector):
         #                          pred_scores[:-self.test_cfg.num_sem_cls, :],
         #                          #pred_labels[:-self.test_cfg.num_sem_cls, :],
         #                          superpoints, self.test_cfg.inst_score_thr)
-        sem_res = self.pred_sem(pred_masks[-self.test_cfg.num_sem_cls:, :],
-                                superpoints)
+        with _profiling_profile(profiler, 'semantic_head'):
+            sem_res = self.pred_sem(pred_masks[-self.test_cfg.num_sem_cls:, :],
+                                    superpoints)
         
-        inst_res = self.pred_inst_sem(pred_masks[:-self.test_cfg.num_sem_cls, :],
-                                  pred_scores[:-self.test_cfg.num_sem_cls, :],
-                                  superpoints, self.test_cfg.inst_score_thr, sem_res)
-        pan_res = self.pred_pan(pred_masks, pred_scores, #pred_labels,
-                                superpoints, sem_res)
+        with _profiling_profile(profiler, 'instance_head'):
+            inst_res = self.pred_inst_sem(pred_masks[:-self.test_cfg.num_sem_cls, :],
+                                      pred_scores[:-self.test_cfg.num_sem_cls, :],
+                                      superpoints, self.test_cfg.inst_score_thr, sem_res)
+        with _profiling_profile(profiler, 'panoptic_head'):
+            pan_res = self.pred_pan(pred_masks, pred_scores, #pred_labels,
+                                    superpoints, sem_res)
 
         pts_semantic_mask = [sem_res.cpu().numpy(), pan_res[0].cpu().numpy()]
         pts_instance_mask = [inst_res[0].cpu().bool().numpy(),
@@ -2648,7 +2939,8 @@ class ForAINetV2OneFormer3D_XAwarequery(Base3DDetector):
                 instance_labels=inst_res[1].cpu().numpy(),
                 instance_scores=inst_res[2].cpu().numpy())]
 
-    def predict_by_feat_test(self, out, superpoints, coordinates, queries):
+    def predict_by_feat_test(self, out, superpoints, coordinates, queries,
+                             profiler=None):
         """Predict instance, semantic, and panoptic masks for a single scene.
 
         Args:
@@ -2670,19 +2962,25 @@ class ForAINetV2OneFormer3D_XAwarequery(Base3DDetector):
         #                          pred_scores[:-self.test_cfg.num_sem_cls, :],
         #                          #pred_labels[:-self.test_cfg.num_sem_cls, :],
         #                          superpoints, self.test_cfg.inst_score_thr)
-        sem_res = self.pred_sem(pred_masks[-self.test_cfg.num_sem_cls:, :],
-                                superpoints)
+        with _profiling_profile(profiler, 'semantic_head',
+                                region=profiler is not None):
+            sem_res = self.pred_sem(pred_masks[-self.test_cfg.num_sem_cls:, :],
+                                    superpoints)
         
-        # Calculate ground_z_max from coordinates of points classified as ground
-        ground_points = coordinates[sem_res == 0]
-        ground_z_max = ground_points[:, 2].max().item() if ground_points.size(0) > 0 else float('inf')
+        with _profiling_profile(profiler, 'ground_height_estimation',
+                                region=profiler is not None):
+            ground_points = coordinates[sem_res == 0]
+            ground_z_max = ground_points[:, 2].max().item() if ground_points.size(0) > 0 else float('inf')
 
-        
-        inst_res = self.pred_inst_sem_test(pred_masks[:-self.test_cfg.num_sem_cls, :],
-                                  pred_scores[:-self.test_cfg.num_sem_cls, :],
-                                  superpoints, self.test_cfg.inst_score_thr, sem_res, coordinates, ground_z_max, queries)
-        pan_res = self.pred_pan_sem(pred_masks, pred_scores, #pred_labels,
-                                superpoints, sem_res, coordinates, ground_z_max, queries)
+        with _profiling_profile(profiler, 'instance_head',
+                                region=profiler is not None):
+            inst_res = self.pred_inst_sem_test(pred_masks[:-self.test_cfg.num_sem_cls, :],
+                                      pred_scores[:-self.test_cfg.num_sem_cls, :],
+                                      superpoints, self.test_cfg.inst_score_thr, sem_res, coordinates, ground_z_max, queries)
+        with _profiling_profile(profiler, 'panoptic_head',
+                                region=profiler is not None):
+            pan_res = self.pred_pan_sem(pred_masks, pred_scores, #pred_labels,
+                                    superpoints, sem_res, coordinates, ground_z_max, queries)
 
         pts_semantic_mask = [sem_res.cpu().numpy(), pan_res[0].cpu().numpy()]
         pts_instance_mask = [inst_res[0].cpu().bool().numpy(),
@@ -3895,14 +4193,14 @@ class ForAINetV2OneFormer3D_XAwarequery(Base3DDetector):
         mask_matrix = csr_matrix((data, (row_indices, col_indices)), shape=(num_points, num_masks), dtype=np.float32)
 
         # Compute the IoU between masks
-        intersection = mask_matrix.T @ mask_matrix
+        interprofile = mask_matrix.T @ mask_matrix
         mask_sizes = mask_matrix.sum(axis=0).A1
-        union = mask_sizes[:, None] + mask_sizes - intersection
+        union = mask_sizes[:, None] + mask_sizes - interprofile
 
         # Ensure no division by zero
         union[union == 0] = 1
 
-        iou = intersection / union
+        iou = interprofile / union
 
         print(f"Computed IoU matrix:\n{iou}")
 

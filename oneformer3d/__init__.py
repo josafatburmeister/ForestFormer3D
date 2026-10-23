@@ -10,7 +10,8 @@ from .semantic_criterion import (
 from .instance_criterion import (
     InstanceCriterion, InstanceCriterionForAI, QueryClassificationCost, MaskBCECost, MaskDiceCost,
     HungarianMatcher, SparseMatcher, OneDataCriterion)
-from .loading import LoadAnnotations3D_, NormalizePointsColor_
+from .loading import LoadAnnotations3D_, NormalizePointsColor_, \
+    TimedLoadPointsFromFile_
 from .formatting import Pack3DDetInputs_
 from .transforms_3d import (
     ElasticTransfrom, AddSuperPointAnnotations, SwapChairAndFloor, PointSample_)
