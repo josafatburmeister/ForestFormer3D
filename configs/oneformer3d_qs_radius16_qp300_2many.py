@@ -78,7 +78,8 @@ model = dict(
         profiling=dict(
             enabled=True,
             log_to_stdout=False,
-            csv_path='/workspace/data-2/wacv/profile_forest_former_3d/inference_profile_nibio_19.csv')))
+            csv_path='/workspace/data-2/wacv/profile_forest_former_3d/inference_profile_nibio_19.csv')
+        ))
 
 # dataset settings
 dataset_type = 'ForAINetV2SegDataset_'

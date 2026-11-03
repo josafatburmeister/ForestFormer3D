@@ -2849,12 +2849,6 @@ class ForAINetV2OneFormer3D_XAwarequery(Base3DDetector):
                 for data_sample in batch_data_samples:
                     data_sample.pred_pts_seg = None
 
-
-            profile_report = profiler.build_report()
-
-            profile_report_df = pd.DataFrame([profile_report])
-            profile_report_df.to_csv("/workspace/data-2/wacv/profile_forest_former_3d/detailed_performance_metrics.csv")
-
             return batch_data_samples
         else:
             with profiler.profile('collate'):
@@ -2889,8 +2883,6 @@ class ForAINetV2OneFormer3D_XAwarequery(Base3DDetector):
                 if profile_report is not None:
                     data_sample.pred_pts_seg['inference_profile'] = \
                         profile_report
-
-            profile_report = profiler.build_report()
 
             return batch_data_samples
 
